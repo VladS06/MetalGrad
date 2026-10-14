@@ -1,60 +1,53 @@
 #include <fstream>
 #include <iostream>
-#include <numbers>
+#include <thread>
 #include <random>
+#include <valarray>
 
 typedef unsigned int uint;
 
 struct Layer {
     uint input_size;
-    float* input;
-    float* d_input;
-    float* activation;
-    Layer(uint input_size): input_size(input_size) {
-        input = new float[input_size]();
-        d_input = new float[input_size]();
-        activation = new float[input_size]();
+    uint output_size;
+    uint max_batch_size;
+    std::vector<float> input;
+    std::vector<float> output;
+    std::vector<float> d_input;
+    std::vector<float> activation;
+
+    Layer(uint input_size, uint max_batch_size, uint output_size):max_batch_size(max_batch_size), input_size(input_size), output_size(output_size), input(max_batch_size * input_size, 0.0f), output(max_batch_size * output_size, 0.0f), d_input(max_batch_size * input_size, 0.0f), activation(max_batch_size * output_size, 0.0f) {
     }
-    virtual void forward(float* input_data) = 0;
-    virtual void backward_pass(float* true_labels) = 0;
+    virtual void forward(float* input_data, uint batch_index) = 0;
+    virtual void backward_pass(float* true_labels, uint batch_index) = 0;
     virtual void update_parameters(float learning_rate, uint batch_size) = 0;
     virtual ~Layer() {
-        delete[] input;
-        delete[] d_input;
-        delete[] activation;
+
     }
 };
 
 struct DenseLayer:  Layer {
-    uint output_size;
-    float* biases;
-    float* weights;
-    float* output;
-    float* d_weights;
-    float* d_output;
-    float* d_biases;
+    std::vector<float>biases;
+    std::vector<float>weights;
+    std::vector<float>d_weights;
+    std::vector<float>d_output;
+    std::vector<float>d_biases;
     bool is_hidden;
-    DenseLayer(uint input_size, uint output_size,bool is_hidden): Layer(input_size), output_size(output_size), is_hidden(is_hidden) {
-        biases = new float[output_size];
-        for (int i = 0; i < output_size; i++)
-            biases[i] = 0.1f;
-        weights = new float[input_size * output_size]();
-        output = new float[output_size]();
-        d_weights = new float[input_size * output_size]();
-        d_output = new float[output_size]();
-        d_biases = new float[output_size]();
-    }
+    std::vector<float>grad_weights_sum;
+    std::vector<float>grad_biases_sum;
+    DenseLayer(uint input_size, uint output_size,bool is_hidden, uint max_batch_size): Layer(input_size, max_batch_size, output_size), is_hidden(is_hidden),
+    biases(output_size, 0.1f),
+    weights(input_size * output_size, 0.0f),
+    d_weights(max_batch_size * input_size * output_size, 0.0f),
+    d_output(max_batch_size * output_size, 0.0f),
+    d_biases(max_batch_size * output_size, 0.0f),
+    grad_weights_sum(input_size * output_size, 0.0f),
+    grad_biases_sum(output_size, 0.0f){}
+
+
     ~DenseLayer() override{
-
-        delete[] biases;
-        delete[] weights;
-        delete[] output;
-        delete[] d_weights;
-        delete[] d_output;
-        delete[] d_biases;
     }
 
-    void initialize_weights() const {
+    void initialize_weights(){
         std::random_device rd;
         std::mt19937 generator(rd());
         std::normal_distribution <float>nd(0.0f, 0.1f);
@@ -63,124 +56,196 @@ struct DenseLayer:  Layer {
         }
     }
 
-    void forward(float* input_data) override {
+    void forward(float* input_data, uint batch_index) override {
         for (uint i = 0; i < input_size; i++)
-            input[i] = input_data[i];
+            input[batch_index * input_size + i] = input_data[i];
         for (uint j = 0; j < output_size; j++) {
-            activation[j] = 0.0f;
-            output[j] = biases[j];
-            for (uint i = 0; i < input_size; i++) {
-                output[j] += input[i] * weights[i* output_size+ j];
+            activation[batch_index * output_size + j] = 0.0f;
+            output[batch_index * output_size + j] = biases[j];
+        }
+        for (uint i = 0; i < input_size; i++) {
+            for (uint j = 0; j < output_size; j++) {
+                output[batch_index * output_size + j] += input[batch_index * input_size + i] * weights[i* output_size+ j];
             }
+        }
+        for (uint j = 0; j < output_size; j++) {
             if (is_hidden)
-                activation[j] = output[j] > 0 ? output[j] : 0;
+                activation[batch_index * output_size + j] = output[batch_index * output_size + j] > 0 ? output[batch_index * output_size + j] : 0;
             else
-                activation[j] = output[j];
+                activation[batch_index * output_size + j] = output[batch_index * output_size + j];
         }
     }
 
-    float compute_loss(float* true_labels) {
-        float loss = 0.0f;
-        for (uint i = 0; i < output_size; i++) {
-            loss += (activation[i] - true_labels[i])*(activation[i] - true_labels[i]);
-        }
-        return loss / output_size;
-    }
-    void backward_pass(float* incoming_gradients) override {
+    void backward_pass(float* incoming_gradients, uint batch_index) override {
         for (unsigned int i = 0; i < output_size; i++) {
             if (is_hidden)
-                d_output[i] = output[i] > 0.0f ? incoming_gradients[i] : 0.0f;
+                d_output[batch_index * output_size + i] = output[batch_index * output_size + i] > 0.0f ? incoming_gradients[i] : 0.0f;
             else
-                d_output[i] = incoming_gradients[i];
+                d_output[batch_index * output_size + i] = incoming_gradients[i];
         }
         for (uint i = 0; i < input_size; i++) {
             for (uint j = 0; j < output_size; j++) {
-                d_weights[i * output_size + j] += d_output[j] * input[i];
+                d_weights[batch_index * input_size * output_size + i * output_size + j] = d_output[batch_index * output_size + j] * input[batch_index * input_size + i];
             }
         }
         for (uint j = 0; j < output_size; j++) {
-            d_biases[j] += d_output[j];
+            d_biases[batch_index * output_size + j] = d_output[batch_index * output_size + j];
         }
         for (uint i = 0; i < input_size; i++) {
-            d_input[i] = 0.0f;
+            d_input[batch_index * input_size + i] = 0.0f;
             for (uint j = 0; j < output_size; j++) {
-                d_input[i] += d_output[j] * weights[i * output_size + j];
+                d_input[batch_index * input_size + i] += d_output[batch_index * output_size + j] * weights[i * output_size + j];
             }
         }
     }
     void update_parameters(float learning_rate, uint batch_size) override {
-        float step_size = 1.0f / batch_size * learning_rate;
-        for (uint i = 0; i < input_size; i++) {
-            for (uint j = 0; j < output_size; j++) {
-                weights[i * output_size + j] -= step_size * d_weights[i * output_size + j];
-                d_weights[i*output_size + j] = 0.0f;
+        std::fill_n(grad_weights_sum.begin(), input_size * output_size, 0.0f);
+        std::fill_n(grad_biases_sum.begin(), output_size, 0.0f);
+        float step_size = learning_rate / batch_size;
+        for (uint batch = 0; batch < batch_size; batch++) {
+            for (uint i = 0; i < input_size * output_size; i++) {
+                grad_weights_sum[i] += d_weights[batch* input_size * output_size + i];
+
             }
         }
+
+        for (uint batch = 0; batch < batch_size; batch++) {
+            for (uint j = 0; j < output_size; j++) {
+                grad_biases_sum[j] += d_biases[batch * output_size + j];
+            }
+        }
+        for (uint i = 0; i < input_size * output_size; i++) {
+                weights[i] -= step_size * grad_weights_sum[i];
+            }
+
         for (uint j = 0; j < output_size; j++) {
-            biases[j] -= step_size * d_biases[j];
-            d_biases[j] = 0.0f;
+            biases[j] -= step_size * grad_biases_sum[j];
         }
     }
 };
 
-struct SoftmaxLayer: Layer{
-    SoftmaxLayer(uint input_size): Layer(input_size){}
-
-    void forward(float* input_data) override {
-        float maxInput = input_data[0];
-        for (uint i = 0; i < input_size; i++) {
-            input[i] = input_data[i];
-            if (input[i] > maxInput)
-                maxInput = input[i];
-        }
-        float sum = 0.0f;
-        for (uint i = 0; i < input_size; i++) {
-            float exp_val = std::exp(input[i]-maxInput);
-            sum += exp_val;
-            activation[i] = exp_val;
-        }
-        float norm = 1.0f / sum;
-        for (uint i = 0; i < input_size; i++) {
-            activation[i] *= norm;
-        }
+void apply_softmax(float* logits, uint size) {
+    float maxInput = logits[0];
+    for (uint i = 0; i < size; i++) {
+        if (logits[i] > maxInput)
+            maxInput = logits[i];
     }
-    void backward_pass(float* true_labels) override {
-        for (uint i = 0; i < input_size; i++) {
-            d_input[i] = activation[i] - true_labels[i];
-        }
+    float sum = 0.0f;
+    for (uint i = 0; i < size; i++) {
+        float exp_val = std::exp(logits[i] - maxInput);
+        sum += exp_val;
+        logits[i] = exp_val;
     }
-    void update_parameters(float learning_rate, uint batch_size) override {}
-};
+    float norm = 1.0f / sum;
+    for (uint i = 0; i < size; i++) {
+        logits[i] *= norm;
+    }
+}
 
 struct NeuralNetwork {
     std::vector<Layer*> layers;
-    void forward(float* initial_input) {
+    float** current_batch_input;
+    float** current_batch_labels;
+    uint batch_size;
+    std::vector<std::thread> threads;
+    std::mutex padlock;
+    std::condition_variable thread_bell;
+    std::condition_variable manager_bell;
+    std::atomic<bool> terminate_pool;
+    std::atomic<uint> active_threads;
+    std::atomic<uint> current_index;
+    std::vector<float> initial_gradients;
+    uint output_size;
+    uint job_id = 0;
+
+
+    NeuralNetwork(uint batch_size): batch_size(batch_size) {
+        terminate_pool = false;
+        active_threads = 0;
+        job_id = 0;
+
+        for (uint i = 0; i < std::thread::hardware_concurrency(); i++) {
+            threads.push_back(std::thread([this, i]() {
+                uint my_last_job = 0;
+
+                while (true) {
+                    std::unique_lock<std::mutex> lock(padlock);
+
+                    thread_bell.wait(lock, [&]() {
+                        return my_last_job != job_id || terminate_pool;
+                    });
+
+                    if (terminate_pool) break;
+
+                    my_last_job = job_id;
+                    lock.unlock();
+                    while (current_index < this->batch_size) {
+                        uint j = current_index.fetch_add(1);
+                        if (j >= this->batch_size) break;
+                        forward(current_batch_input[j], j);
+                        backward(current_batch_labels[j], j);
+                    }
+                    --active_threads;
+                    if (active_threads == 0) {
+                        manager_bell.notify_one();
+                    }
+                }
+            }));
+        }
+    }
+
+    void forward(float* initial_input, uint batch_index) {
         float* current_input = initial_input;
         for (auto layer: layers) {
-            layer->forward(current_input);
-            current_input = layer->activation;
+            layer->forward(current_input, batch_index);
+            current_input = &(layer->activation[batch_index * layer->output_size]);
+        }
+        apply_softmax(current_input, output_size);
+    }
+    void backward(float* true_labels, uint batch_index) {
+        for (uint i = 0; i < output_size; i++) {
+           layers[layers.size()-1]->activation[batch_index * output_size + i] -= true_labels[i];
+           initial_gradients[output_size * batch_index + i] = layers[layers.size()-1]->activation[batch_index * output_size + i];
+        }
+        float* current_gradients = &initial_gradients[output_size * batch_index];
+        for (auto it= layers.rbegin(); it != layers.rend(); it++) {
+            (*it)->backward_pass(current_gradients, batch_index);
+            current_gradients = &(*it)->d_input[(*it)->input_size * batch_index];
         }
     }
-    void backward(float* true_labels) {
-        float* curr_input = true_labels;
-        for(auto it = layers.rbegin(); it != layers.rend(); it++) {
-            (*it)->backward_pass(curr_input);
-            curr_input = (*it)->d_input;
-        }
-    }
-    void train_on_batch(float** batch_inputs, float ** batch_labels, uint batch_size, float learning_rate) {
-        for (uint i = 0; i < batch_size; i++) {
-            forward(batch_inputs[i]);
-            backward(batch_labels[i]);
-        }
+    void train_on_batch(float** batch_inputs, float ** batch_labels, uint current_batch_size, float learning_rate) {
+       std::unique_lock<std::mutex> lock(padlock);
+        current_batch_input = batch_inputs;
+        current_batch_labels = batch_labels;
+        batch_size = current_batch_size;
+        active_threads = std::thread::hardware_concurrency();
+        job_id++;
+        current_index = 0;
+        thread_bell.notify_all();
+        manager_bell.wait(lock, [&](){return active_threads == 0;});
         for (auto layer: layers) {
-            layer->update_parameters(learning_rate, batch_size);
+            layer->update_parameters(learning_rate, current_batch_size);
         }
     }
+
     float* predict(float* single_input) {
-        forward(single_input);
-        return layers[layers.size()-1]->activation;
+        forward(single_input, 0);
+        return &layers[layers.size()-1]->activation[0];
     }
+    ~NeuralNetwork() {
+        std::unique_lock<std::mutex> lock(padlock);
+        terminate_pool = true;
+        thread_bell.notify_all();
+        lock.unlock();
+        for (std::thread& thread: threads) {
+            thread.join();
+        }
+    }
+    void compile() {
+        output_size = layers[layers.size()-1]->output_size;
+        initial_gradients.resize(output_size * batch_size);
+    }
+
 };
 
 uint32_t flip_endian(unsigned char* bytes) {
@@ -258,27 +323,32 @@ int main() {
     float** images = load_mnist_images("/Users/vlad/PersonalProjects/AI/NeuralNetwork/train-images-idx3-ubyte", num_images);
     uint32_t num_labels;
     float** labels = load_mnist_labels("/Users/vlad/PersonalProjects/AI/NeuralNetwork/train-labels-idx1-ubyte", num_labels);
+
+    uint32_t num_test_images;
+    uint32_t num_test_labels;
+    float** test_images = load_mnist_images("/Users/vlad/PersonalProjects/AI/NeuralNetwork/t10k-images-idx3-ubyte", num_test_images);
+    float** test_labels = load_mnist_labels("/Users/vlad/PersonalProjects/AI/NeuralNetwork/t10k-labels-idx1-ubyte", num_test_labels);
     if (num_images != num_labels) {
         std::cerr << "FATAL: Data mismatch! Images: " << num_images << " Labels: " << num_labels << '\n';
         return 1;
     }
     std::cout << "Successfully loaded " << num_labels << " pairs.\n";
-    NeuralNetwork nn;
-    DenseLayer* l1 = new DenseLayer(784, 128, true);
+    NeuralNetwork nn(128);
+    DenseLayer* l1 = new DenseLayer(784, 128, true, 128);
     l1->initialize_weights();
     nn.layers.push_back(l1);
 
-    DenseLayer* l2 = new DenseLayer(128, 10, false);
+    DenseLayer* l2 = new DenseLayer(128, 10, false, 128);
     l2->initialize_weights();
     nn.layers.push_back(l2);
 
-    SoftmaxLayer* l3 = new SoftmaxLayer(10);
-    nn.layers.push_back(l3);
-    for (uint i = 0; i < 10; i++) {
+    nn.compile();
+
+    for (uint i = 0; i < 50; i++) {
         for (uint j = 0; j < num_images; j = j + 128) {
-            nn.train_on_batch(images + j, labels + j, std::min((uint)128, (num_images - j)), 0.01f);
+            nn.train_on_batch(images + j, labels + j, std::min((uint)128, (num_images - j)), 0.1f);
         }
-        float acc = calculate_accuracy(nn, images, labels, num_images);
+        float acc = calculate_accuracy(nn, test_images, test_labels, num_test_images);
         std::cout << "--- Epoch " << i << " ---\nAccuracy: " << acc * 100.0f << "%\n\n";
     }
 
