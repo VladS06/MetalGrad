@@ -3,6 +3,7 @@
 #include <thread>
 #include <random>
 #include <valarray>
+#include <algorithm>
 #include <vector>
 
 typedef unsigned int uint;
@@ -35,12 +36,46 @@ struct Layer {
         activation(max_batch_size * align_to_cache(output_size), 0.0f) {
     }
     virtual void forward(float* input_data, uint batch_index) = 0;
-    virtual void backward_pass(float* true_labels, uint batch_index) = 0;
+    virtual void backward_pass(float* true_labels, uint batch_index, uint thread_id) = 0;
     virtual void update_parameters(float learning_rate, uint batch_size) = 0;
+    virtual void clear_thread_gradients(uint thread_id) = 0;
     virtual ~Layer() {}
+
+    virtual void reduce_thread_gradients(uint thread_id, uint num_threads) = 0;
 };
 
 struct DenseLayer : Layer {
+    void reduce_thread_gradients(uint thread_id, uint num_threads) override {
+        uint total_weights = input_size* output_size;
+
+        uint w_chunk = total_weights / num_threads;
+        uint w_start = thread_id* w_chunk;
+        uint w_end = (thread_id != num_threads - 1) ? w_start + w_chunk : total_weights;
+
+        uint b_chunk = output_size / num_threads;
+        uint b_start = thread_id* b_chunk;
+        uint b_end = (thread_id != num_threads - 1) ? b_start + b_chunk : output_size;
+        std::fill_n(grad_weights_sum.begin() + w_start, w_end - w_start, 0.0f);
+        std::fill_n(grad_biases_sum.begin() + b_start, b_end - b_start, 0.0f);
+
+        for (uint j = 0; j < num_threads; j++) {
+            for (uint i = w_start; i < w_end; i++) {
+                grad_weights_sum[i] += d_weights[j * input_size * output_size + i];
+            }
+            for (uint i = b_start; i < b_end; i++) {
+                grad_biases_sum[i] += d_biases[j * stride_output + i];
+            }
+        }
+
+
+    }
+
+    void clear_thread_gradients(uint thread_id) override {
+        std::fill_n(d_weights.data()+ thread_id * input_size * output_size, input_size * output_size, 0.0f);
+        std::fill_n(d_biases.data() + thread_id * align_to_cache(output_size), align_to_cache(output_size), 0.0f);
+    }
+
+    uint num_threads;
     std::vector<float> biases;
     std::vector<float> weights;
     std::vector<float> d_weights;
@@ -51,15 +86,16 @@ struct DenseLayer : Layer {
     std::vector<float> grad_weights_sum;
     std::vector<float> grad_biases_sum;
 
-    DenseLayer(uint input_size, uint output_size, bool is_hidden, uint max_batch_size) :
+    DenseLayer(uint input_size, uint output_size, bool is_hidden, uint max_batch_size, uint num_threads) :
         Layer(input_size, max_batch_size, output_size),
+        num_threads(num_threads),
         is_hidden(is_hidden),
         stride_output(align_to_cache(output_size)),
         biases(output_size, 0.1f),
         weights(input_size * output_size, 0.0f),
-        d_weights(max_batch_size * input_size * output_size, 0.0f),
+        d_weights(num_threads * input_size * output_size, 0.0f),
         d_output(max_batch_size * align_to_cache(output_size), 0.0f),
-        d_biases(max_batch_size * align_to_cache(output_size), 0.0f),
+        d_biases(num_threads * align_to_cache(output_size), 0.0f),
         grad_weights_sum(input_size * output_size, 0.0f),
         grad_biases_sum(output_size, 0.0f) {}
 
@@ -95,7 +131,7 @@ struct DenseLayer : Layer {
         }
     }
 
-    void backward_pass(float* incoming_gradients, uint batch_index) override {
+    void backward_pass(float* incoming_gradients, uint batch_index, uint thread_id) override {
         for (unsigned int i = 0; i < output_size; i++) {
             if (is_hidden)
                 d_output[batch_index * stride_output + i] = output[batch_index * stride_output + i] > 0.0f ? incoming_gradients[i] : 0.0f;
@@ -104,11 +140,11 @@ struct DenseLayer : Layer {
         }
         for (uint i = 0; i < input_size; i++) {
             for (uint j = 0; j < output_size; j++) {
-                d_weights[batch_index * input_size * output_size + i * output_size + j] = d_output[batch_index * stride_output + j] * input[batch_index * input_size + i];
+                d_weights[thread_id * input_size * output_size + i*output_size + j] += d_output[batch_index * stride_output + j] * input[batch_index * input_size + i];
             }
         }
         for (uint j = 0; j < output_size; j++) {
-            d_biases[batch_index * stride_output + j] = d_output[batch_index * stride_output + j];
+            d_biases[thread_id * stride_output + j] += d_output[batch_index * stride_output + j];
         }
         for (uint i = 0; i < input_size; i++) {
             d_input[batch_index * input_size + i] = 0.0f;
@@ -119,20 +155,8 @@ struct DenseLayer : Layer {
     }
 
     void update_parameters(float learning_rate, uint batch_size) override {
-        std::fill_n(grad_weights_sum.begin(), input_size * output_size, 0.0f);
-        std::fill_n(grad_biases_sum.begin(), output_size, 0.0f);
         float step_size = learning_rate / batch_size;
 
-        for (uint batch = 0; batch < batch_size; batch++) {
-            for (uint i = 0; i < input_size * output_size; i++) {
-                grad_weights_sum[i] += d_weights[batch * input_size * output_size + i];
-            }
-        }
-        for (uint batch = 0; batch < batch_size; batch++) {
-            for (uint j = 0; j < output_size; j++) {
-                grad_biases_sum[j] += d_biases[batch * stride_output + j]; // FIXED
-            }
-        }
         for (uint i = 0; i < input_size * output_size; i++) {
             weights[i] -= step_size * grad_weights_sum[i];
         }
@@ -177,12 +201,18 @@ struct NeuralNetwork {
     uint output_size;
     uint job_id = 0;
 
+    enum State {
+        IDLE,
+        COMPUTE,
+        REDUCE
+    }state;
+
     NeuralNetwork(uint batch_size) : batch_size(batch_size) {
         terminate_pool = false;
         active_threads = 0;
         job_id = 0;
 
-        for (uint i = 0; i < std::thread::hardware_concurrency(); i++) {
+            for (uint i = 0; i < std::thread::hardware_concurrency(); i++) {
             threads.push_back(std::thread([this, i]() {
                 uint my_last_job = 0;
                 while (true) {
@@ -193,17 +223,35 @@ struct NeuralNetwork {
                     if (terminate_pool) break;
                     my_last_job = job_id;
                     lock.unlock();
-
+                    for (auto& layer: layers) {
+                        layer->clear_thread_gradients(i);
+                    }
                     while (current_index < this->batch_size) {
                         uint j = current_index.fetch_add(1);
                         if (j >= this->batch_size) break;
                         forward(current_batch_input + j * input_size, j);
-                        backward(current_batch_labels + j * output_size, j);
+                        backward(current_batch_labels + j * output_size, j, i);
                     }
+                    lock.lock();
                     --active_threads;
                     if (active_threads == 0) {
+                        state = REDUCE;
+                        thread_bell.notify_all();
+                        active_threads = std::thread::hardware_concurrency();
+                    }else {
+                        thread_bell.wait(lock, [&](){return state == REDUCE;});
+                    }
+                    lock.unlock();
+                    for (auto& layer: layers) {
+                        layer->reduce_thread_gradients(i, std::thread::hardware_concurrency());
+                    }
+                    lock.lock();
+                    --active_threads;
+                    if (active_threads == 0) {
+                        state = State::IDLE;
                         manager_bell.notify_one();
                     }
+                    lock.unlock();
                 }
             }));
         }
@@ -213,22 +261,20 @@ struct NeuralNetwork {
         float* current_input = initial_input;
         for (auto layer : layers) {
             layer->forward(current_input, batch_index);
-            // FIXED: pointer now offsets by aligned stride to match physical memory
             current_input = &(layer->activation[batch_index * align_to_cache(layer->output_size)]);
         }
         apply_softmax(current_input, output_size);
     }
 
-    void backward(float* true_labels, uint batch_index) {
+    void backward(float* true_labels, uint batch_index, uint thread_index) {
         uint final_stride = align_to_cache(output_size);
         for (uint i = 0; i < output_size; i++) {
-            // FIXED: index into the padded activation array using final_stride
             layers.back()->activation[batch_index * final_stride + i] -= true_labels[i];
             initial_gradients[output_size * batch_index + i] = layers.back()->activation[batch_index * final_stride + i];
         }
         float* current_gradients = &initial_gradients[output_size * batch_index];
         for (auto it = layers.rbegin(); it != layers.rend(); it++) {
-            (*it)->backward_pass(current_gradients, batch_index);
+            (*it)->backward_pass(current_gradients, batch_index, thread_index);
             current_gradients = &(*it)->d_input[(*it)->input_size * batch_index];
         }
     }
@@ -241,8 +287,9 @@ struct NeuralNetwork {
         active_threads = std::thread::hardware_concurrency();
         job_id++;
         current_index = 0;
+        state = State::COMPUTE;
         thread_bell.notify_all();
-        manager_bell.wait(lock, [&]() { return active_threads == 0; });
+        manager_bell.wait(lock, [&]() { return state == State::IDLE; });
         for (auto layer : layers) {
             layer->update_parameters(learning_rate, current_batch_size);
         }
@@ -359,11 +406,13 @@ int main() {
 
     NeuralNetwork nn(BATCH_SIZE);
 
-    DenseLayer* l1 = new DenseLayer(IMAGE_SIZE, 128, true, BATCH_SIZE);
+    uint thread_number = std::thread::hardware_concurrency();
+
+    DenseLayer* l1 = new DenseLayer(IMAGE_SIZE, 128, true, BATCH_SIZE, thread_number);
     l1->initialize_weights();
     nn.layers.push_back(l1);
 
-    DenseLayer* l2 = new DenseLayer(128, NUM_CLASSES, false, BATCH_SIZE);
+    DenseLayer* l2 = new DenseLayer(128, NUM_CLASSES, false, BATCH_SIZE, thread_number);
     l2->initialize_weights();
     nn.layers.push_back(l2);
 

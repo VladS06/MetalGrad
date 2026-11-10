@@ -3,4 +3,5 @@ project(NeuralNetwork)
 
 set(CMAKE_CXX_STANDARD 20)
 
-add_executable(NeuralNetwork main.cpp)
+add_executable(NeuralNetwork main.cpp
+        bench_gemm.cpp)
